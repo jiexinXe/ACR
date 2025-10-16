@@ -190,12 +190,8 @@ def main():
     parser.add_argument('--ema-mu', default=0.99, type=float,
                         help='mu when ema')
 
-    parser.add_argument('--tau1', default=2, type=float,
-                        help='tau for head1 consistency')
-    parser.add_argument('--tau12', default=2, type=float,
-                        help='tau for head2 consistency')
-    parser.add_argument('--tau2', default=2, type=float,
-                        help='tau for head2 balanced CE loss')
+    parser.add_argument('--tau', default=2.0, type=float,
+                        help='tau for (fixed) logit adjustment in both branches')
     parser.add_argument('--ema-u', default=0.9, type=float,
                         help='ema ratio for estimating distribution of the unlabeled data')
     parser.add_argument('--est-epoch', default=5, type=int,
@@ -349,12 +345,7 @@ def main():
 
     args.py_uni = args.py_uni.to(args.device)
 
-    args.adjustment_l1 = compute_adjustment_by_py(args.py_con, args.tau1, args)
-    args.adjustment_l12 = compute_adjustment_by_py(args.py_con, args.tau12, args)
-    args.adjustment_l2 = compute_adjustment_by_py(args.py_con, args.tau2, args)
-
-    args.taumin = 0
-    args.taumax = args.tau1
+    args.adjustment = compute_adjustment_by_py(args.py_con, args.tau, args)
 
     class_list = []
     for i in range(args.num_classes):
@@ -449,11 +440,6 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
     labeled_iter = iter(labeled_trainloader)
     unlabeled_iter = iter(unlabeled_trainloader)
 
-    if args.resume:
-        count_KL = torch.zeros(3).to(args.device)
-
-    KL_div = nn.KLDivLoss(reduction='sum')
-
     model.train()
     for epoch in range(args.start_epoch, args.epochs):
         print('current epoch: ', epoch+1)
@@ -465,32 +451,27 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
         mask_probs = AverageMeter()
 
         if epoch > args.est_epoch:
-            count_KL = count_KL / args.eval_step
-            KL_softmax = (torch.exp(count_KL[0])) / (torch.exp(count_KL[0])+torch.exp(count_KL[1])+torch.exp(count_KL[2]))
-            tau = args.taumin + (args.taumax - args.taumin) * KL_softmax
-            if math.isnan(tau)==False:
-                args.adjustment_l1 = compute_adjustment_by_py(args.py_con, tau, args)
-
-        count_KL = torch.zeros(3).to(args.device)
+            print()
+            # args.adjustment_l1 = compute_adjustment_by_py(args.py_con, tau, args)
 
         for batch_idx in range(args.eval_step):
             try:
-                inputs_x, targets_x = labeled_iter.next()
+                inputs_x, targets_x = next(labeled_iter)
             except:
                 if args.world_size > 1:
                     labeled_epoch += 1
                     labeled_trainloader.sampler.set_epoch(labeled_epoch)
                 labeled_iter = iter(labeled_trainloader)
-                inputs_x, targets_x = labeled_iter.next()
+                inputs_x, targets_x = next(labeled_iter)
 
             try:
-                (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = unlabeled_iter.next()
+                (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = next(unlabeled_iter)
             except:
                 if args.world_size > 1:
                     unlabeled_epoch += 1
                     unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
                 unlabeled_iter = iter(unlabeled_trainloader)
-                (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = unlabeled_iter.next()
+                (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = next(unlabeled_iter)
 
             u_real = u_real.cuda()
             mask_l = (u_real != -2)
@@ -517,25 +498,22 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             logits_x_b = logits_b[:batch_size]
             logits_u_w_b, logits_u_s_b, logits_u_s1_b = logits_b[batch_size:].chunk(3)
             del logits_b
-            Lx_b = F.cross_entropy(logits_x_b + args.adjustment_l2, targets_x, reduction='mean')
+            Lx_b = F.cross_entropy(logits_x_b + args.adjustment, targets_x, reduction='mean')
 
-            pseudo_label = torch.softmax((logits_u_w.detach() - args.adjustment_l1) / args.T, dim=-1)
-            pseudo_label_h2 = torch.softmax((logits_u_w.detach() - args.adjustment_l12) / args.T, dim=-1)
+            pseudo_label = torch.softmax((logits_u_w.detach() - args.adjustment) / args.T, dim=-1)
             pseudo_label_b = torch.softmax(logits_u_w_b.detach() / args.T, dim=-1)
             pseudo_label_t = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
 
             max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-            max_probs_h2, targets_u_h2 = torch.max(pseudo_label_h2, dim=-1)
             max_probs_b, targets_u_b = torch.max(pseudo_label_b, dim=-1)
             max_probs_t, targets_u_t = torch.max(pseudo_label_t, dim=-1)
 
             mask = max_probs.ge(args.threshold)
-            mask_h2 = max_probs_h2.ge(args.threshold)
             mask_b = max_probs_b.ge(args.threshold)
             mask_t = max_probs_t.ge(args.threshold)
 
-            mask_ss_b_h2 = mask_b + mask_h2
-            mask_ss_t = mask + mask_t
+            mask_ss_b_h2 = mask_b + mask  # 替换原来的：mask_ss_b_h2 = mask_b + mask_h2
+            mask_ss_t = mask + mask_t  # 保持不变
 
             mask = mask.float()
             mask_b = mask_b.float()
@@ -548,32 +526,17 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
 
             logits_u_s_twice = torch.cat([logits_u_s, logits_u_s1], dim=0).cuda()
             targets_u_twice = torch.cat([targets_u, targets_u], dim=0).cuda()
-            targets_u_h2_twice = torch.cat([targets_u_h2, targets_u_h2], dim=0).cuda()
-
             logits_u_s_b_twice = torch.cat([logits_u_s_b, logits_u_s1_b], dim=0).cuda()
 
             now_mask = torch.zeros(args.num_classes)
             now_mask = now_mask.to(args.device)
             u_real[u_real==-2] = 0
 
-            if epoch > args.est_epoch:
-                now_mask[targets_u_b] += mask_l*mask_b
-                args.est_step = args.est_step + 1
-
-                if now_mask.sum() > 0:
-                    now_mask = now_mask / now_mask.sum()
-                    args.u_py = args.ema_u * args.u_py + (1-args.ema_u) * now_mask
-                    KL_con = 0.5 * KL_div(args.py_con.log(), args.u_py) + 0.5 * KL_div(args.u_py.log(), args.py_con)
-                    KL_uni = 0.5 * KL_div(args.py_uni.log(), args.u_py) + 0.5 * KL_div(args.u_py.log(), args.py_uni)
-                    KL_rev = 0.5 * KL_div(args.py_rev.log(), args.u_py) + 0.5 * KL_div(args.u_py.log(), args.py_rev)
-                    count_KL[0] = count_KL[0] + KL_con
-                    count_KL[1] = count_KL[1] + KL_uni
-                    count_KL[2] = count_KL[2] + KL_rev
-
             Lu = (F.cross_entropy(logits_u_s_twice, targets_u_twice,
                                   reduction='none') * mask_twice_ss_t).mean()
-            Lu_b = (F.cross_entropy(logits_u_s_b_twice, targets_u_h2_twice,
+            Lu_b = (F.cross_entropy(logits_u_s_b_twice, targets_u_twice,
                                     reduction='none') * mask_twice_ss_b_h2).mean()
+
             loss = Lx + Lu + Lx_b + Lu_b
             loss.backward()
             losses.update(loss.item())
