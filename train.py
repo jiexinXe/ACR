@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset.cifar import DATASET_GETTERS
 from utils import AverageMeter, accuracy
 from utils import Logger
+from progress.bar import Bar
 
 logger = logging.getLogger(__name__)
 best_acc = 0
@@ -192,8 +193,6 @@ def main():
 
     parser.add_argument('--tau', default=2.0, type=float,
                         help='tau for (fixed) logit adjustment in both branches')
-    parser.add_argument('--ema-u', default=0.9, type=float,
-                        help='ema ratio for estimating distribution of the unlabeled data')
     parser.add_argument('--est-epoch', default=5, type=int,
                         help='the start step to estimate the distribution')
     parser.add_argument('--img-size', default=32, type=int,
@@ -450,6 +449,9 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
         losses_u = AverageMeter()
         mask_probs = AverageMeter()
 
+        # 仅主进程显示进度条
+        bar = Bar('Training', max=args.eval_step) if args.local_rank in [-1, 0] else None
+
         if epoch > args.est_epoch:
             print()
             # args.adjustment_l1 = compute_adjustment_by_py(args.py_con, tau, args)
@@ -551,6 +553,32 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             batch_time.update(time.time() - end)
             end = time.time()
             mask_probs.update(mask.mean().item())
+
+            # 统计耗时
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            # 更新进度条内容（仅主进程）
+            if bar is not None:
+                bar.suffix = (
+                    '({batch}/{size}) | Batch: {bt:.3f}s | Total: {total} | ETA: {eta} | '
+                    'Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | '
+                    'Loss_u: {loss_u:.4f}'
+                ).format(
+                    batch=batch_idx + 1,
+                    size=args.eval_step,
+                    bt=batch_time.avg,
+                    total=bar.elapsed_td,
+                    eta=bar.eta_td,
+                    loss=losses.avg,
+                    loss_x=losses_x.avg,
+                    loss_u=losses_u.avg,
+                )
+                bar.next()
+
+        if bar is not None:
+            bar.finish()
+        print('\n')
 
         avg_time.append(batch_time.avg)
 
