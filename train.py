@@ -18,10 +18,27 @@ from dataset.cifar import DATASET_GETTERS
 from utils import AverageMeter, accuracy
 from utils import Logger
 from progress.bar import Bar
+from typing import Optional
+
 
 logger = logging.getLogger(__name__)
 best_acc = 0
 best_acc_b = 0
+
+def top2_gap(prob: torch.Tensor) -> torch.Tensor:
+    v = prob.topk(2, dim=1).values
+    return v[:, 0] - v[:, 1]
+
+def js_divergence(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    m = 0.5 * (p + q)
+    return 0.5 * ( (p * (torch.log(p + eps) - torch.log(m + eps))).sum(1) +
+                   (q * (torch.log(q + eps) - torch.log(m + eps))).sum(1) )
+
+def scarce_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    # mean over valid positions; avoid divide-by-zero
+    denom = mask.sum().clamp_min(1.0)
+    return (x * mask).sum() / denom
+
 
 
 def make_imb_data(max_num, class_num, gamma, flag = 1, flag_LT = 0):
@@ -197,6 +214,26 @@ def main():
                         help='the start step to estimate the distribution')
     parser.add_argument('--img-size', default=32, type=int,
                         help='image size for small imagenet')
+
+    # === ours: modules & hyper-params ===
+    parser.add_argument('--dwmm', action='store_true', help='enable DWMM')
+    parser.add_argument('--dwmm_tau0', type=float, default=0.20, help='target margin for DWMM hinge/softplus')
+    parser.add_argument('--dwmm_alpha', type=float, default=1.0, help='weighting alpha for JS in DWMM')
+    parser.add_argument('--dwmm_beta', type=float, default=1.0, help='weighting beta for gap in DWMM')
+    parser.add_argument('--dwmm_lambda', type=float, default=0.7, help='loss weight for DWMM')
+
+    parser.add_argument('--ddvmix', action='store_true', help='enable DD-V-Mix')
+    parser.add_argument('--ddvmix_lambda', type=float, default=0.5, help='loss weight for DD-V-Mix')
+    parser.add_argument('--ddvmix_kappa', type=float, default=1.0, help='Beta(kappa,kappa) for vicinal lambda')
+
+    parser.add_argument('--selcons', action='store_true', help='enable selective consistency (consensus-only KL)')
+    parser.add_argument('--selcons_lambda_c', type=float, default=0.1, help='KL weight on consensus region')
+
+    parser.add_argument('--tau_hi', type=float, default=0.85, help='high-confidence threshold')
+    parser.add_argument('--tau_lo', type=float, default=0.60, help='low-confidence threshold')
+    parser.add_argument('--gap_delta', type=float, default=0.15, help='boundary top1-top2 gap threshold')
+    parser.add_argument('--proto_m', type=float, default=0.99, help='EMA momentum for class prototypes')
+
 
     args = parser.parse_args()
     global best_acc
@@ -500,6 +537,16 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             logits_x_b = logits_b[:batch_size]
             logits_u_w_b, logits_u_s_b, logits_u_s1_b = logits_b[batch_size:].chunk(3)
             del logits_b
+
+            # === NEW: also de_interleave the features to pick unlabeled features ===
+            feats = de_interleave(logits_feat, 3*args.mu+1)
+            feats_x = feats[:batch_size]
+            feats_u_w, feats_u_s, feats_u_s1 = feats[batch_size:].chunk(3)
+            # 初始化/检查 prototypes
+            if not hasattr(args, 'prototypes') or (args.prototypes is None):
+                args.prototypes = torch.zeros(args.num_classes, feats_x.size(1), device=args.device)
+                args.proto_cnt = torch.zeros(args.num_classes, device=args.device)
+
             Lx_b = F.cross_entropy(logits_x_b + args.adjustment, targets_x, reduction='mean')
 
             pseudo_label = torch.softmax((logits_u_w.detach() - args.adjustment) / args.T, dim=-1)
@@ -534,12 +581,116 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             now_mask = now_mask.to(args.device)
             u_real[u_real==-2] = 0
 
-            Lu = (F.cross_entropy(logits_u_s_twice, targets_u_twice,
-                                  reduction='none') * mask_twice_ss_t).mean()
-            Lu_b = (F.cross_entropy(logits_u_s_b_twice, targets_u_twice,
-                                    reduction='none') * mask_twice_ss_b_h2).mean()
+            # Lu = (F.cross_entropy(logits_u_s_twice, targets_u_twice,
+            #                       reduction='none') * mask_twice_ss_t).mean()
+            # Lu_b = (F.cross_entropy(logits_u_s_b_twice, targets_u_twice,
+            #                         reduction='none') * mask_twice_ss_b_h2).mean()
+            #
+            # loss = Lx + Lu + Lx_b + Lu_b
+            # -------------------- OUR MODULES START --------------------
+            # ===== 统一概率、置信度、边界性判定 =====
+            pA_w = torch.softmax((logits_u_w.detach() - args.adjustment) / args.T, dim=1)   # head A (your 'standard' head)
+            pB_w = torch.softmax(logits_u_w_b.detach() / args.T, dim=1)                     # head B (your 'balanced' head)
+            sA, cA = pA_w.max(1); sB, cB = pB_w.max(1)
+            gapA = top2_gap(pA_w); gapB = top2_gap(pB_w)
+            gap_min = torch.minimum(gapA, gapB)
 
-            loss = Lx + Lu + Lx_b + Lu_b
+            tau_hi, tau_lo, delta = args.tau_hi, args.tau_lo, args.gap_delta
+            lowlow = (torch.maximum(sA, sB) < tau_lo)
+            leanA  = (sA >= tau_hi) & (sB < tau_hi)
+            leanB  = (sB >= tau_hi) & (sA < tau_hi)
+            # 强边界：双高不同类 + 小间距
+            bdboth = (sA >= tau_hi) & (sB >= tau_hi) & (cA != cB) & (gap_min <= delta)
+            # 弱边界：一高一低 + 小间距 + 另一头 top2 包含高置信头的 top1
+            cross_AinB = (pB_w.topk(2,1).indices == cA[:,None]).any(1)
+            cross_BinA = (pA_w.topk(2,1).indices == cB[:,None]).any(1)
+            weak_bdry = ((leanA & cross_AinB) | (leanB & cross_BinA)) & (gap_min <= delta)
+
+            # ====== 原有 supervised/unlabeled CE (保持原样) ======
+            Lu = (F.cross_entropy(logits_u_s_twice, targets_u_twice, reduction='none') * mask_twice_ss_t).mean()
+            Lu_b = (F.cross_entropy(logits_u_s_b_twice, targets_u_twice, reduction='none') * mask_twice_ss_b_h2).mean()
+
+            # ====== DWMM: 分歧加权的最大间隔 ======
+            L_dwmm = torch.tensor(0., device=args.device)
+            if args.dwmm:
+                # JS & gap 归一作为权重
+                JS = js_divergence(pA_w, pB_w)
+                JSn  = (JS - JS.mean()) / (JS.std() + 1e-6)
+                gapn = (gap_min - gap_min.mean()) / (gap_min.std() + 1e-6)
+                w_dw = torch.sigmoid(args.dwmm_alpha * JSn - args.dwmm_beta * gapn).detach()
+
+                # 使用融合 logit 计算 logit-margin
+                z_co_w = 0.5 * (logits_u_w + logits_u_w_b)  # 简洁起步；可换成 α(x) 动态融合
+                top2 = z_co_w.topk(2, dim=1)
+                margin = top2.values[:,0] - top2.values[:,1]
+                mm_hinge = torch.clamp(args.dwmm_tau0 - margin, min=0.0)
+                mask_dw = (bdboth | weak_bdry).float()
+                # 稀缺归一
+                L_dwmm = scarce_mean(w_dw * mm_hinge, mask_dw)
+
+            # ====== DD-V-Mix: 沿边界 vicinal / mixup（特征空间） ======
+            L_mix = torch.tensor(0., device=args.device)
+            if args.ddvmix:
+                idx = (bdboth | weak_bdry).nonzero(as_tuple=True)[0]
+                if idx.numel() > 0:
+                    # 取特征 & 类原型；首次已初始化 args.prototypes
+                    muA = args.prototypes[cA[idx]]
+                    muB = args.prototypes[cB[idx]]
+                    # Beta(kappa,kappa) or靠近0.5（随JS/gap可调，这里用常数/无梯度）
+                    lam = torch.full((idx.numel(),), 0.5, device=args.device)
+                    # 邻域插值：当前样本特征 vs 两类原型均值
+                    h_cur = feats_u_w[idx]
+                    h_mix = lam[:,None]*h_cur + (1-lam[:,None]) * 0.5*(muA + muB)
+                    # 经过分类头（任一头都可，这里用 head A）
+                    z_mix = model.classify(h_mix)
+                    logp_mix = F.log_softmax(z_mix, dim=1)
+                    # 双类软目标
+                    q = torch.zeros_like(z_mix)
+                    q.scatter_(1, cA[idx,None], lam[:,None])
+                    q.scatter_(1, cB[idx,None], (1-lam)[:,None])
+                    L_mix = F.kl_div(logp_mix, q, reduction='batchmean')
+
+            # ====== Selective Consistency：只在共识高置信区对齐 ======
+            L_selc = torch.tensor(0., device=args.device)
+            if args.selcons:
+                consensus = (cA == cB) & (torch.minimum(sA, sB) >= tau_hi)
+                if consensus.any():
+                    pa = F.log_softmax(logits_u_w[consensus], dim=1)
+                    pb = F.softmax(logits_u_w_b[consensus].detach(), dim=1)
+                    L_ab = F.kl_div(pa, pb, reduction='batchmean')
+                    pb2 = F.log_softmax(logits_u_w_b[consensus], dim=1)
+                    pa2 = F.softmax(logits_u_w[consensus].detach(), dim=1)
+                    L_ba = F.kl_div(pb2, pa2, reduction='batchmean')
+                    L_selc = 0.5 * (L_ab + L_ba) * args.selcons_lambda_c
+
+            # ====== 原型 EMA 更新（用标注 + 可靠伪标签的样本） ======
+            with torch.no_grad():
+                m = args.proto_m
+                # labeled
+                for cls in targets_x.unique():
+                    cls = int(cls.item())
+                    mask_c = (targets_x == cls)
+                    if mask_c.any():
+                        mean_c = feats_x[mask_c].mean(0)
+                        args.prototypes[cls] = m*args.prototypes[cls] + (1-m)*mean_c
+                # 可靠伪标签（共识或可靠 lean）
+                reliable_leanA = leanA & cross_AinB & (gap_min <= delta)
+                reliable_leanB = leanB & cross_BinA & (gap_min <= delta)
+                reliable_u = ( (cA==cB) & (torch.minimum(sA,sB)>=tau_hi) ) | reliable_leanA | reliable_leanB
+                if reliable_u.any():
+                    cls_idx = torch.where(reliable_u, cA, cB)  # 共识用 cA==cB，其余取高置信那头的类
+                    for cls in cls_idx.unique():
+                        cls = int(cls.item())
+                        mask_c = reliable_u & (cls_idx==cls)
+                        if mask_c.any():
+                            mean_c = feats_u_w[mask_c].mean(0)
+                            args.prototypes[cls] = m*args.prototypes[cls] + (1-m)*mean_c
+
+            # ====== 汇总无标块 & 总损失 ======
+            loss_u_block = Lu + Lu_b + args.dwmm_lambda * L_dwmm + args.ddvmix_lambda * L_mix + L_selc
+            loss = Lx + Lx_b + loss_u_block
+            # -------------------- OUR MODULES END --------------------
+
             loss.backward()
             losses.update(loss.item())
             losses_x.update(Lx.item()+Lx_b.item())
