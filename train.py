@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset.cifar import DATASET_GETTERS
 from utils import AverageMeter, accuracy
 from utils import Logger
+from progress.bar import Bar
 
 logger = logging.getLogger(__name__)
 best_acc = 0
@@ -464,6 +465,9 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
         losses_u = AverageMeter()
         mask_probs = AverageMeter()
 
+        # 仅主进程显示进度条
+        bar = Bar('Training', max=args.eval_step) if args.local_rank in [-1, 0] else None
+
         if epoch > args.est_epoch:
             count_KL = count_KL / args.eval_step
             KL_softmax = (torch.exp(count_KL[0])) / (torch.exp(count_KL[0])+torch.exp(count_KL[1])+torch.exp(count_KL[2]))
@@ -475,22 +479,22 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
 
         for batch_idx in range(args.eval_step):
             try:
-                inputs_x, targets_x = labeled_iter.next()
+                inputs_x, targets_x = next(labeled_iter)
             except:
                 if args.world_size > 1:
                     labeled_epoch += 1
                     labeled_trainloader.sampler.set_epoch(labeled_epoch)
                 labeled_iter = iter(labeled_trainloader)
-                inputs_x, targets_x = labeled_iter.next()
+                inputs_x, targets_x = next(labeled_iter)
 
             try:
-                (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = unlabeled_iter.next()
+                (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = next(unlabeled_iter)
             except:
                 if args.world_size > 1:
                     unlabeled_epoch += 1
                     unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
                 unlabeled_iter = iter(unlabeled_trainloader)
-                (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = unlabeled_iter.next()
+                (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = next(unlabeled_iter)
 
             u_real = u_real.cuda()
             mask_l = (u_real != -2)
@@ -588,6 +592,32 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             batch_time.update(time.time() - end)
             end = time.time()
             mask_probs.update(mask.mean().item())
+
+            # 统计耗时
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            # 更新进度条内容（仅主进程）
+            if bar is not None:
+                bar.suffix = (
+                    '({batch}/{size}) | Batch: {bt:.3f}s | Total: {total} | ETA: {eta} | '
+                    'Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | '
+                    'Loss_u: {loss_u:.4f}'
+                ).format(
+                    batch=batch_idx + 1,
+                    size=args.eval_step,
+                    bt=batch_time.avg,
+                    total=bar.elapsed_td,
+                    eta=bar.eta_td,
+                    loss=losses.avg,
+                    loss_x=losses_x.avg,
+                    loss_u=losses_u.avg,
+                )
+                bar.next()
+
+        if bar is not None:
+            bar.finish()
+        print('\n')
 
         avg_time.append(batch_time.avg)
 
