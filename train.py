@@ -6,6 +6,7 @@ import os
 import random
 import shutil
 import time
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,27 +25,12 @@ best_acc = 0
 best_acc_b = 0
 
 
-def make_imb_data(max_num, class_num, gamma, flag = 1, flag_LT = 0):
-    mu = np.power(1/gamma, 1/(class_num - 1))
-    class_num_list = []
-    for i in range(class_num):
-        if i == (class_num - 1):
-            class_num_list.append(int(max_num / gamma))
-        else:
-            class_num_list.append(int(max_num * np.power(mu, i)))
-
-    if flag == 0 and flag_LT == 1:
-        class_num_list = list(reversed(class_num_list))
-    return list(class_num_list)
-
-
-def compute_adjustment_list(label_list, tro, args):
-    label_freq_array = np.array(label_list)
-    label_freq_array = label_freq_array / label_freq_array.sum()
-    adjustments = np.log(label_freq_array ** tro + 1e-12)
-    adjustments = torch.from_numpy(adjustments)
-    adjustments = adjustments.to(args.device)
-    return adjustments
+def js_divergence(p, q, eps=1e-12):
+    # p,q: [B,C] prob
+    m = 0.5 * (p + q)
+    kl_pm = (p * (torch.log(p + eps) - torch.log(m + eps))).sum(dim=-1)
+    kl_qm = (q * (torch.log(q + eps) - torch.log(m + eps))).sum(dim=-1)
+    return 0.5 * (kl_pm + kl_qm)  # [B]
 
 
 def compute_py(train_loader, args):
@@ -191,9 +177,9 @@ def main():
     parser.add_argument('--ema-mu', default=0.99, type=float,
                         help='mu when ema')
 
-    parser.add_argument('--tau1', default=2, type=float,
+    parser.add_argument('--tau1', default=1, type=float,
                         help='tau for head1 consistency')
-    parser.add_argument('--tau12', default=2, type=float,
+    parser.add_argument('--tau12', default=1, type=float,
                         help='tau for head2 consistency')
     parser.add_argument('--tau2', default=2, type=float,
                         help='tau for head2 balanced CE loss')
@@ -201,6 +187,17 @@ def main():
                         help='ema ratio for estimating distribution of the unlabeled data')
     parser.add_argument('--est-epoch', default=5, type=int,
                         help='the start step to estimate the distribution')
+    parser.add_argument('--dwsc-lambda', default=0.10, type=float,
+                        help='lambda for disagreement-weighted soft consistency (DW-SC), starts at est-epoch')
+    parser.add_argument('--dwsc-warm-epochs', default=10, type=int,
+                        help='warmup epochs for DW-SC lambda ramp (starts at est-epoch)')
+    parser.add_argument('--dwct-class-alpha', default=0.0, type=float,
+                        help='class-aware threshold scaling for pseudo-label masks (0 disables)')
+    parser.add_argument('--dwct-js-self-th', default=0.20, type=float,
+                        help='JS threshold for enabling head2 self-training when heads agree')
+    parser.add_argument('--dwct-self-lambda', default=0.25, type=float,
+                        help='weight for head2 self-training loss (only on safe-agree samples)')
+
     parser.add_argument('--img-size', default=32, type=int,
                         help='image size for small imagenet')
 
@@ -261,6 +258,24 @@ def main():
     if args.local_rank in [-1, 0]:
         os.makedirs(args.out, exist_ok=True)
         args.writer = SummaryWriter(args.out)
+        # ---- disagreement diagnostics logging (epoch-level CSV) ----
+        args.diag_csv = os.path.join(args.out, "disagreement_diagnostics.csv")
+        if not os.path.exists(args.diag_csv):
+            with open(args.diag_csv, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "epoch",
+                    "mask1_rate","mask2_rate","both_conf_rate","disagree_rate","conflict_both_rate",
+                    "js_w_mean","js_w_q50","js_w_q90","js_w_q99",
+                    "js_s_mean","agree_h1_ws","agree_h2_ws",
+                    "pl_acc_h1_on_u_real","pl_acc_h2_on_u_real",
+                    "pl_acc_h1_conf_on_u_real","pl_acc_h2_conf_on_u_real",
+                    "conflict_any_rate",
+                    "pl_acc_conflict_any_on_u_real","pl_acc_conflict_both_on_u_real",
+                    "pl_acc_conflict_any_conf_on_u_real","pl_acc_conflict_both_conf_on_u_real",
+                    "L_conflict","L_soft","Lu_h1","Lu_h2","Lu_total",
+                ])
+
 
     if args.dataset == 'cifar10':
         args.num_classes = 10
@@ -464,6 +479,34 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
         losses_x = AverageMeter()
         losses_u = AverageMeter()
         mask_probs = AverageMeter()
+        # ---- disagreement diagnostics (reset per epoch) ----
+        js_w_meter = AverageMeter()
+        js_s_meter = AverageMeter()
+        disagree_meter = AverageMeter()
+        conflict_both_meter = AverageMeter()
+        mask1_meter = AverageMeter()
+        mask2_meter = AverageMeter()
+        both_conf_meter = AverageMeter()
+        agree_h1_ws_meter = AverageMeter()
+        agree_h2_ws_meter = AverageMeter()
+        pl_acc_h1_meter = AverageMeter()
+        pl_acc_h2_meter = AverageMeter()
+        pl_acc_h1_conf_meter = AverageMeter()
+        pl_acc_h2_conf_meter = AverageMeter()
+
+        conflict_any_meter = AverageMeter()
+        pl_acc_conflict_any_meter = AverageMeter()
+        pl_acc_conflict_both_meter = AverageMeter()
+        pl_acc_conflict_any_conf_meter = AverageMeter()
+        pl_acc_conflict_both_conf_meter = AverageMeter()
+        L_conflict_meter = AverageMeter()
+        L_soft_meter = AverageMeter()
+        Lu_h1_meter = AverageMeter()
+        Lu_h2_meter = AverageMeter()
+        Lu_total_meter = AverageMeter()
+        # buffers for quantiles (store CPU tensors, small overhead)
+        js_w_buf = []
+
 
         # 仅主进程显示进度条
         bar = Bar('Training', max=args.eval_step) if args.local_rank in [-1, 0] else None
@@ -525,7 +568,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
 
             pseudo_label = torch.softmax((logits_u_w.detach() - args.adjustment_l1) / args.T, dim=-1)
             pseudo_label_h2 = torch.softmax((logits_u_w.detach() - args.adjustment_l12) / args.T, dim=-1)
-            pseudo_label_b = torch.softmax(logits_u_w_b.detach() / args.T, dim=-1)
+            pseudo_label_b = torch.softmax((logits_u_w_b.detach() + args.adjustment_l2) / args.T, dim=-1)
             pseudo_label_t = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
 
             max_probs, targets_u = torch.max(pseudo_label, dim=-1)
@@ -533,65 +576,219 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             max_probs_b, targets_u_b = torch.max(pseudo_label_b, dim=-1)
             max_probs_t, targets_u_t = torch.max(pseudo_label_t, dim=-1)
 
-            mask = max_probs.ge(args.threshold)
-            mask_h2 = max_probs_h2.ge(args.threshold)
-            mask_b = max_probs_b.ge(args.threshold)
-            mask_t = max_probs_t.ge(args.threshold)
+            # 1) binary masks (bool)
+            # ===================== Disagreement-Weighted Cross-Teaching (DWCT) =====================
+            # Key idea:
+            #   - Disagreement is a *risk* signal in SSL (high epistemic uncertainty) -> downweight hard pseudo-label CE.
+            #   - Keep teacher/mask aligned: head2 learns from head1-alt teacher when using maskh2.
+            #   - No conflict-specific loss (avoid pulling heads to an incorrect "average" early).
+            #
+            # Hyper-params kept minimal:
+            #   - warmup: reuse args.est_epoch (no new CLI)
+            #   - gamma fixed to 2 (stronger downweight on high disagreement)
+            #   - head2 self-training disabled by default (set self_lambda>0 if you want)
 
-            mask_ss_b_h2 = mask_b + mask_h2
-            mask_ss_t = mask + mask_t
+            # 1) confidence masks
+            # Optional: class-aware thresholds to increase tail pseudo-label coverage (default off).
+            # Set args.dwct_class_alpha in [0.1, 0.5] to enable (tail gets lower tau).
+            alpha_tau = float(getattr(args, 'dwct_class_alpha', 0.0))
+            if alpha_tau > 0 and hasattr(args, 'py_con') and args.py_con is not None:
+                with torch.no_grad():
+                    py = args.py_con.to(max_probs.device).float()
+                    tmin, tmax = py.min(), py.max()
+                    tailness_table = 1.0 - (py - tmin) / (tmax - tmin + 1e-12)  # head:0, tail:1
+                    tau_base = float(args.threshold)
+                    tau_min = float(getattr(args, 'dwct_tau_min', 0.70))
+                    tau_max = float(getattr(args, 'dwct_tau_max', 0.98))
+                    tau1  = (tau_base * (1.0 - alpha_tau * tailness_table[targets_u])).clamp(tau_min, tau_max)
+                    tau2  = (tau_base * (1.0 - alpha_tau * tailness_table[targets_u_b])).clamp(tau_min, tau_max)
+                    taut  = (tau_base * (1.0 - alpha_tau * tailness_table[targets_u_t])).clamp(tau_min, tau_max)
+                    tauh2 = (tau_base * (1.0 - alpha_tau * tailness_table[targets_u_h2])).clamp(tau_min, tau_max)
+                mask1 = max_probs.ge(tau1)          # head1 (debiased) confident
+                mask2 = max_probs_b.ge(tau2)        # head2 confident
+                maskt = max_probs_t.ge(taut)        # head1 (raw) confident
+                maskh2 = max_probs_h2.ge(tauh2)     # head1-alt teacher confident
+            else:
+                mask1 = max_probs.ge(args.threshold)          # head1 (debiased) confident
+                mask2 = max_probs_b.ge(args.threshold)        # head2 confident
+                maskt = max_probs_t.ge(args.threshold)        # head1 (raw) confident
+                maskh2 = max_probs_h2.ge(args.threshold)      # head1-alt teacher confident
 
-            mask = mask.float()
-            mask_b = mask_b.float()
+            # keep weights in {0,1}: use OR (avoid '+' -> weight 2)
+            mask_sup_h1 = (mask1 | maskt)                 # head1 hard-PL eligibility (keep your original design)
+            mask_sup_h2_ct = maskh2                       # head2 cross-teaching eligibility (teacher == head1-alt)
+            mask_sup_h2_self = mask2                      # head2 self-training eligibility (optional, disabled below)
 
-            mask_ss_b_h2 = mask_ss_b_h2.float()
-            mask_ss_t = mask_ss_t.float()
+            # 2) disagreement (normalized JS in [0,1]) and reliability weight
+            with torch.no_grad():
+                js_w = js_divergence(pseudo_label, pseudo_label_b) / (math.log(args.num_classes) + 1e-12)
 
-            mask_twice_ss_b_h2 = torch.cat([mask_ss_b_h2, mask_ss_b_h2], dim=0).cuda()
-            mask_twice_ss_t = torch.cat([mask_ss_t, mask_ss_t], dim=0).cuda()
+                # DW-SC: treat disagreement as *informative uncertainty*.
+# - We DO NOT downweight hard pseudo-label CE by disagreement (keeps baseline signal).
+# - We DO use disagreement to add a soft-consistency regularizer (defined below).
+                js_n = js_w.clamp(0.0, 1.0)
+                w_dis_eff = torch.ones_like(js_n)
+                conf_mean = 0.5 * (max_probs.detach() + max_probs_b.detach())
+                w_soft = (js_n * (1.0 - js_n) * conf_mean).clamp(0.0, 1.0)
+            # ---- disagreement diagnostics (per step, epoch-averaged) ----
+            with torch.no_grad():
+                disagree = (targets_u != targets_u_b)
+                both_conf = (mask1 & mask2)
+                conflict_both = both_conf & disagree
+                conflict_any = disagree & (mask1 | mask2)
 
-            logits_u_s_twice = torch.cat([logits_u_s, logits_u_s1], dim=0).cuda()
-            targets_u_twice = torch.cat([targets_u, targets_u], dim=0).cuda()
-            targets_u_h2_twice = torch.cat([targets_u_h2, targets_u_h2], dim=0).cuda()
+                # rates
+                mask1_meter.update(mask1.float().mean().item())
+                mask2_meter.update(mask2.float().mean().item())
+                both_conf_meter.update(both_conf.float().mean().item())
+                disagree_meter.update(disagree.float().mean().item())
+                conflict_both_meter.update(conflict_both.float().mean().item())
+                conflict_any_meter.update(conflict_any.float().mean().item())
+                js_w_meter.update(js_n.mean().item())
+                js_w_buf.append(js_n.detach().cpu())
 
-            logits_u_s_b_twice = torch.cat([logits_u_s_b, logits_u_s1_b], dim=0).cuda()
+                # weak->strong agreement
+                p1_s = torch.softmax((logits_u_s.detach() - args.adjustment_l1) / args.T, dim=-1)
+                p2_s = torch.softmax((logits_u_s_b.detach() + args.adjustment_l2) / args.T, dim=-1)
+                pred1_s = p1_s.argmax(dim=-1)
+                pred2_s = p2_s.argmax(dim=-1)
+                agree_h1_ws_meter.update((pred1_s == targets_u).float().mean().item())
+                agree_h2_ws_meter.update((pred2_s == targets_u_b).float().mean().item())
+                js_s = (js_divergence(pseudo_label, pseudo_label_b) / (math.log(args.num_classes) + 1e-12)).clamp(0.0, 1.0)
+                js_s_meter.update(js_s.mean().item())
 
-            now_mask = torch.zeros(args.num_classes)
-            now_mask = now_mask.to(args.device)
-            u_real[u_real==-2] = 0
+                # pseudo-label accuracy on u_real subset (if available)
+                if mask_l.any():
+                    acc1 = (targets_u == u_real).float()
+                    acc2 = (targets_u_b == u_real).float()
+                    pl_acc_h1_meter.update(acc1[mask_l].mean().item())
+                    pl_acc_h2_meter.update(acc2[mask_l].mean().item())
+                    if (mask_l & mask1).any():
+                        pl_acc_h1_conf_meter.update(acc1[mask_l & mask1].mean().item())
+                    if (mask_l & mask2).any():
+                        pl_acc_h2_conf_meter.update(acc2[mask_l & mask2].mean().item())
+                    # conflict buckets
+                    if (mask_l & conflict_any).any():
+                        pl_acc_conflict_any_meter.update(acc1[mask_l & conflict_any].mean().item())
+                    if (mask_l & conflict_both).any():
+                        pl_acc_conflict_both_meter.update(acc1[mask_l & conflict_both].mean().item())
+                    if (mask_l & conflict_any & mask1).any():
+                        pl_acc_conflict_any_conf_meter.update(acc1[mask_l & conflict_any & mask1].mean().item())
+                    if (mask_l & conflict_both & mask1).any():
+                        pl_acc_conflict_both_conf_meter.update(acc1[mask_l & conflict_both & mask1].mean().item())
 
+
+
+            # ---- dynamic tau bookkeeping (restore baseline; DWCT-safe) ----
+            # In baseline, count_KL is accumulated from an EMA estimate of unlabeled label distribution u_py.
+            # Under DWCT, we intentionally estimate u_py ONLY from "safe & agreeing" pseudo-labels
+            # to avoid high-disagreement samples biasing tau.
             if epoch > args.est_epoch:
-                now_mask[targets_u_b] += mask_l*mask_b
-                args.est_step = args.est_step + 1
+                with torch.no_grad():
+                    args.est_step = getattr(args, "est_step", 0) + 1
+                    est_w = (mask_l & mask1 & mask2 & (targets_u == targets_u_b)).float()
+                    if est_w.sum() > 0:
+                        now_mask = torch.zeros(args.num_classes, device=args.device)
+                        now_mask.index_add_(0, targets_u_b, est_w)
+                        if now_mask.sum() > 0:
+                            now_mask = now_mask / (now_mask.sum() + 1e-12)
+                            args.u_py = args.ema_u * args.u_py + (1 - args.ema_u) * now_mask
 
-                if now_mask.sum() > 0:
-                    now_mask = now_mask / now_mask.sum()
-                    args.u_py = args.ema_u * args.u_py + (1-args.ema_u) * now_mask
-                    KL_con = 0.5 * KL_div(args.py_con.log(), args.u_py) + 0.5 * KL_div(args.u_py.log(), args.py_con)
-                    KL_uni = 0.5 * KL_div(args.py_uni.log(), args.u_py) + 0.5 * KL_div(args.u_py.log(), args.py_uni)
-                    KL_rev = 0.5 * KL_div(args.py_rev.log(), args.u_py) + 0.5 * KL_div(args.u_py.log(), args.py_rev)
-                    count_KL[0] = count_KL[0] + KL_con
-                    count_KL[1] = count_KL[1] + KL_uni
-                    count_KL[2] = count_KL[2] + KL_rev
+                            # symmetric KL to three candidate priors
+                            u_py = args.u_py.clamp(min=1e-12)
+                            py_con = args.py_con.clamp(min=1e-12)
+                            py_uni = args.py_uni.clamp(min=1e-12)
+                            py_rev = args.py_rev.clamp(min=1e-12)
+                            KL_con = 0.5 * KL_div(py_con.log(), u_py) + 0.5 * KL_div(u_py.log(), py_con)
+                            KL_uni = 0.5 * KL_div(py_uni.log(), u_py) + 0.5 * KL_div(u_py.log(), py_uni)
+                            KL_rev = 0.5 * KL_div(py_rev.log(), u_py) + 0.5 * KL_div(u_py.log(), py_rev)
+                            count_KL[0] = count_KL[0] + KL_con
+                            count_KL[1] = count_KL[1] + KL_uni
+                            count_KL[2] = count_KL[2] + KL_rev
 
-            Lu = (F.cross_entropy(logits_u_s_twice, targets_u_twice,
-                                  reduction='none') * mask_twice_ss_t).mean()
-            Lu_b = (F.cross_entropy(logits_u_s_b_twice, targets_u_h2_twice,
-                                    reduction='none') * mask_twice_ss_b_h2).mean()
-            loss = Lx + Lu + Lx_b + Lu_b
+            # head2 safe self-training gate (only after warmup)
+            js_n = js_w.clamp(0.0, 1.0)
+            js_self_th = float(getattr(args, 'dwct_js_self_th', 0.20))
+            self_lambda = float(getattr(args, 'dwct_self_lambda', 0.25)) if epoch >= getattr(args, 'est_epoch', 0) else 0.0
+            agree_top1 = (targets_u == targets_u_b)
+            self_mask = (mask2 & mask1 & agree_top1 & (js_n <= js_self_th))
+
+            # weights (per-sample)
+            w_h1      = mask_sup_h1.float()      * w_dis_eff
+            w_h2_ct   = mask_sup_h2_ct.float()   * w_dis_eff
+            w_h2_self = self_mask.float()        * w_dis_eff
+
+            # twice weights/targets for two strong views
+            w_h1_twice      = torch.cat([w_h1, w_h1], dim=0)
+            w_h2_ct_twice   = torch.cat([w_h2_ct, w_h2_ct], dim=0)
+            w_h2_self_twice = torch.cat([w_h2_self, w_h2_self], dim=0)
+            targets_u_h2_twice = torch.cat([targets_u_h2, targets_u_h2], dim=0)
+            targets_u_twice = torch.cat([targets_u, targets_u], dim=0)
+            targets_u_b_twice = torch.cat([targets_u_b, targets_u_b], dim=0)
+
+            logits_u_s_twice = torch.cat([logits_u_s, logits_u_s1], dim=0)
+            logits_u_s_b_twice = torch.cat([logits_u_s_b, logits_u_s1_b], dim=0)
+
+
+            # FixMatch-style hard CE losses (baseline-style; NOT downweighted by disagreement)
+            Lu = (F.cross_entropy(logits_u_s_twice - args.adjustment_l1, targets_u_twice, reduction='none') * w_h1_twice).mean()
+            Lu_b_ct = (F.cross_entropy(logits_u_s_b_twice + args.adjustment_l2, targets_u_h2_twice, reduction='none') * w_h2_ct_twice).mean()
+            Lu_b_self = (F.cross_entropy(logits_u_s_b_twice + args.adjustment_l2, targets_u_b_twice, reduction='none') * w_h2_self_twice).mean()
+            Lu_b = Lu_b_ct + self_lambda * Lu_b_self
+
+            # DW-SC: disagreement-weighted soft consistency (committee posterior) on strong views
+            dwsc_lambda = float(getattr(args, 'dwsc_lambda', 0.10))
+            est_ep = int(getattr(args, 'est_epoch', 0))
+            warm_ep = int(getattr(args, 'dwsc_warm_epochs', 10))
+            if epoch < est_ep:
+                dwsc_lambda_eff = 0.0
+            elif warm_ep <= 0:
+                dwsc_lambda_eff = dwsc_lambda
+            else:
+                prog = min(1.0, float(epoch - est_ep + 1) / float(warm_ep))
+                dwsc_lambda_eff = dwsc_lambda * prog
+            if dwsc_lambda_eff > 0:
+                with torch.no_grad():
+                    q_w = 0.5 * (pseudo_label + pseudo_label_b)
+                    q_w = (q_w / (q_w.sum(dim=-1, keepdim=True) + 1e-12)).detach()
+                    q_w_twice = torch.cat([q_w, q_w], dim=0)
+                    w_soft_twice = torch.cat([w_soft, w_soft], dim=0)
+                logp1_s = F.log_softmax((logits_u_s_twice - args.adjustment_l1) / args.T, dim=-1)
+                logp2_s = F.log_softmax((logits_u_s_b_twice + args.adjustment_l2) / args.T, dim=-1)
+                kl1 = F.kl_div(logp1_s, q_w_twice, reduction='none').sum(dim=-1)
+                kl2 = F.kl_div(logp2_s, q_w_twice, reduction='none').sum(dim=-1)
+                L_soft = ((kl1 + kl2) * 0.5 * w_soft_twice).mean()
+            else:
+                L_soft = torch.zeros((), device=logits_u_s_twice.device)
+
+            # keep for logging compatibility
+            L_conflict = torch.zeros((), device=logits_u_s_twice.device)
+            Lu_total = Lu + Lu_b + dwsc_lambda_eff * L_soft
+
+            # for logging only: effective hard-PL pass rate for head1
+            sup_h1 = (w_h1 > 0).float()
+
+            # ---- loss diagnostics ----
+            with torch.no_grad():
+                L_conflict_meter.update(float(L_conflict.detach().item()))
+                L_soft_meter.update(float(L_soft.detach().item()))
+                Lu_h1_meter.update(float(Lu.detach().item()))
+                Lu_h2_meter.update(float(Lu_b.detach().item()))
+                Lu_total_meter.update(float(Lu_total.detach().item()))
+
+            # logging: mask = effective hard-PL rate (excluding conflict_both)
+            mask_probs.update(sup_h1.mean().item())
+
+            loss = Lx + Lx_b + Lu_total
             loss.backward()
             losses.update(loss.item())
             losses_x.update(Lx.item()+Lx_b.item())
-            losses_u.update(Lu.item()+Lu_b.item())
+            losses_u.update(Lu_total.item())
             optimizer.step()
             scheduler.step()
             if args.use_ema:
                 ema_model.update(model)
             model.zero_grad()
-
-            batch_time.update(time.time() - end)
-            end = time.time()
-            mask_probs.update(mask.mean().item())
 
             # 统计耗时
             batch_time.update(time.time() - end)
@@ -633,6 +830,59 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
             args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
             args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
+            # ---- disagreement diagnostics: log to TensorBoard + CSV ----
+            if len(js_w_buf) > 0:
+                js_all = torch.cat(js_w_buf, dim=0)
+                js_q50 = torch.quantile(js_all, 0.50).item()
+                js_q90 = torch.quantile(js_all, 0.90).item()
+                js_q99 = torch.quantile(js_all, 0.99).item()
+            else:
+                js_q50 = js_q90 = js_q99 = 0.0
+
+            args.writer.add_scalar('diag/mask1_rate', mask1_meter.avg, epoch)
+            args.writer.add_scalar('diag/mask2_rate', mask2_meter.avg, epoch)
+            args.writer.add_scalar('diag/both_conf_rate', both_conf_meter.avg, epoch)
+            args.writer.add_scalar('diag/disagree_rate', disagree_meter.avg, epoch)
+            args.writer.add_scalar('diag/conflict_both_rate', conflict_both_meter.avg, epoch)
+            args.writer.add_scalar('diag/js_w_mean', js_w_meter.avg, epoch)
+            args.writer.add_scalar('diag/js_w_q90', js_q90, epoch)
+            args.writer.add_scalar('diag/js_s_mean', js_s_meter.avg, epoch)
+            args.writer.add_scalar('diag/agree_h1_ws', agree_h1_ws_meter.avg, epoch)
+            args.writer.add_scalar('diag/agree_h2_ws', agree_h2_ws_meter.avg, epoch)
+            args.writer.add_scalar('diag/pl_acc_h1_on_u_real', pl_acc_h1_meter.avg, epoch)
+            args.writer.add_scalar('diag/pl_acc_h2_on_u_real', pl_acc_h2_meter.avg, epoch)
+            args.writer.add_scalar('diag/pl_acc_h1_conf_on_u_real', pl_acc_h1_conf_meter.avg, epoch)
+            args.writer.add_scalar('diag/pl_acc_h2_conf_on_u_real', pl_acc_h2_conf_meter.avg, epoch)
+
+            args.writer.add_scalar('diag/conflict_any_rate', conflict_any_meter.avg, epoch)
+            args.writer.add_scalar('diag/pl_acc_conflict_any_on_u_real', pl_acc_conflict_any_meter.avg, epoch)
+            args.writer.add_scalar('diag/pl_acc_conflict_both_on_u_real', pl_acc_conflict_both_meter.avg, epoch)
+            args.writer.add_scalar('diag/pl_acc_conflict_any_conf_on_u_real', pl_acc_conflict_any_conf_meter.avg, epoch)
+            args.writer.add_scalar('diag/pl_acc_conflict_both_conf_on_u_real', pl_acc_conflict_both_conf_meter.avg, epoch)
+            args.writer.add_scalar('diag/L_conflict', L_conflict_meter.avg, epoch)
+            args.writer.add_scalar('diag/L_soft', L_soft_meter.avg, epoch)
+            args.writer.add_scalar('diag/Lu_h1', Lu_h1_meter.avg, epoch)
+            args.writer.add_scalar('diag/Lu_h2', Lu_h2_meter.avg, epoch)
+            args.writer.add_scalar('diag/Lu_total', Lu_total_meter.avg, epoch)
+
+
+            # CSV (master only)
+            if args.local_rank in [-1, 0]:
+                with open(args.diag_csv, "a", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow([
+                        epoch,
+                        mask1_meter.avg, mask2_meter.avg, both_conf_meter.avg, disagree_meter.avg, conflict_both_meter.avg,
+                        js_w_meter.avg, js_q50, js_q90, js_q99,
+                        js_s_meter.avg, agree_h1_ws_meter.avg, agree_h2_ws_meter.avg,
+                        pl_acc_h1_meter.avg, pl_acc_h2_meter.avg,
+                        pl_acc_h1_conf_meter.avg, pl_acc_h2_conf_meter.avg,
+                        conflict_any_meter.avg,
+                        pl_acc_conflict_any_meter.avg, pl_acc_conflict_both_meter.avg,
+                        pl_acc_conflict_any_conf_meter.avg, pl_acc_conflict_both_conf_meter.avg,
+                        L_conflict_meter.avg, L_soft_meter.avg, Lu_h1_meter.avg, Lu_h2_meter.avg, Lu_total_meter.avg,
+                    ])
+
             args.writer.add_scalar('test/1.test_acc', test_acc_b, epoch)
             args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
 
