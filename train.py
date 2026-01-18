@@ -177,23 +177,23 @@ def main():
     parser.add_argument('--ema-mu', default=0.99, type=float,
                         help='mu when ema')
 
-    parser.add_argument('--tau1', default=1, type=float,
+    parser.add_argument('--tau1', default=2, type=float,
                         help='tau for head1 consistency')
-    parser.add_argument('--tau12', default=1, type=float,
+    parser.add_argument('--tau12', default=2, type=float,
                         help='tau for head2 consistency')
     parser.add_argument('--tau2', default=2, type=float,
                         help='tau for head2 balanced CE loss')
     parser.add_argument('--ema-u', default=0.9, type=float,
                         help='ema ratio for estimating distribution of the unlabeled data')
-    parser.add_argument('--est-epoch', default=5, type=int,
+    parser.add_argument('--est-epoch', default=40, type=int,
                         help='the start step to estimate the distribution')
     parser.add_argument('--dwsc-lambda', default=0.10, type=float,
                         help='lambda for disagreement-weighted soft consistency (DW-SC), starts at est-epoch')
-    parser.add_argument('--dwsc-warm-epochs', default=10, type=int,
+    parser.add_argument('--dwsc-warm-epochs', default=80, type=int,
                         help='warmup epochs for DW-SC lambda ramp (starts at est-epoch)')
-    parser.add_argument('--dwct-class-alpha', default=0.0, type=float,
+    parser.add_argument('--dwct-class-alpha', default=0.05, type=float,
                         help='class-aware threshold scaling for pseudo-label masks (0 disables)')
-    parser.add_argument('--dwct-js-self-th', default=0.20, type=float,
+    parser.add_argument('--dwct-js-self-th', default=0.05, type=float,
                         help='JS threshold for enabling head2 self-training when heads agree')
     parser.add_argument('--dwct-self-lambda', default=0.25, type=float,
                         help='weight for head2 self-training loss (only on safe-agree samples)')
@@ -264,7 +264,7 @@ def main():
             with open(args.diag_csv, "w", newline="") as f:
                 w = csv.writer(f)
                 w.writerow([
-                    "epoch",
+                    "epoch","tau_curr",
                     "mask1_rate","mask2_rate","both_conf_rate","disagree_rate","conflict_both_rate",
                     "js_w_mean","js_w_q50","js_w_q90","js_w_q99",
                     "js_s_mean","agree_h1_ws","agree_h2_ws",
@@ -365,8 +365,8 @@ def main():
 
     args.py_uni = args.py_uni.to(args.device)
 
-    args.adjustment_l1 = compute_adjustment_by_py(args.py_con, args.tau1, args)
-    args.adjustment_l12 = compute_adjustment_by_py(args.py_con, args.tau12, args)
+    args.adjustment_l1 = compute_adjustment_by_py(args.py_con, 1.0, args)
+    args.adjustment_l12 = compute_adjustment_by_py(args.py_con, 1.0, args)
     args.adjustment_l2 = compute_adjustment_by_py(args.py_con, args.tau2, args)
 
     args.taumin = 0
@@ -410,8 +410,10 @@ def main():
 
     args.start_epoch = 0
 
-    args.u_py = torch.ones(args.num_classes) / args.num_classes
-    args.u_py = args.u_py.to(args.device)
+    args.u_py = args.py_con.clone().detach().float().to(args.device)
+    args.u_py = args.u_py / (args.u_py.sum() + 1e-12)
+    args.tau_curr = 0.0
+    args.acralign_epoch = False
 
     if args.resume:
         logger.info("==> Resuming from checkpoint..")
@@ -465,8 +467,8 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
     labeled_iter = iter(labeled_trainloader)
     unlabeled_iter = iter(unlabeled_trainloader)
 
-    if args.resume:
-        count_KL = torch.zeros(3).to(args.device)
+    # count_KL is used to accumulate symmetric-KL distances for adaptive tau
+    count_KL = torch.zeros(3).to(args.device)
 
     KL_div = nn.KLDivLoss(reduction='sum')
 
@@ -512,13 +514,41 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
         bar = Bar('Training', max=args.eval_step) if args.local_rank in [-1, 0] else None
 
         if epoch > args.est_epoch:
+            # ---- warm-start for tau update ----
+            # In the first epoch after est_epoch, KL statistics (count_KL) may still be all zeros
+            # because they are only accumulated when epoch > est_epoch. If we apply the tau update
+            # with count_KL=0, tau becomes taumax/3 (e.g., 2/3) and can introduce an unnecessary
+            # training-mode perturbation. We instead initialize count_KL from the current u_py estimate.
+            if float(count_KL.abs().sum().item()) < 1e-12:
+                with torch.no_grad():
+                    u_py = args.u_py.detach()
+                    u_py = u_py / (u_py.sum() + 1e-12)
+                    py_con = args.py_con.detach()
+                    py_uni = args.py_uni.detach()
+                    py_rev = args.py_rev.detach()
+                    KL_con = 0.5 * KL_div(py_con.log(), u_py) + 0.5 * KL_div(u_py.log(), py_con)
+                    KL_uni = 0.5 * KL_div(py_uni.log(), u_py) + 0.5 * KL_div(u_py.log(), py_uni)
+                    KL_rev = 0.5 * KL_div(py_rev.log(), u_py) + 0.5 * KL_div(u_py.log(), py_rev)
+                    count_KL = torch.stack([KL_con, KL_uni, KL_rev]) * float(args.eval_step)
+
             count_KL = count_KL / args.eval_step
             KL_softmax = (torch.exp(count_KL[0])) / (torch.exp(count_KL[0])+torch.exp(count_KL[1])+torch.exp(count_KL[2]))
             tau = args.taumin + (args.taumax - args.taumin) * KL_softmax
             if math.isnan(tau)==False:
+                args.tau_curr = float(tau)
                 args.adjustment_l1 = compute_adjustment_by_py(args.py_con, tau, args)
+                # Keep teacher debias strength (tau12) consistent with current tau trajectory, while respecting args.tau12 as an upper bound.
+                tau12_curr = min(float(getattr(args, 'tau12', 1.0)), 1.0 + 0.5 * float(tau))
+                args.adjustment_l12 = compute_adjustment_by_py(args.py_con, tau12_curr, args)
+                # Decide ACR/CCL-style mode *dynamically* based on current tau trajectory.
+                # This prevents 'tau=222' from forcing aggressive behavior in consistent setting.
+                user_acr = (float(getattr(args, 'tau1', 1.0)) > 1.0) or (float(getattr(args, 'tau12', 1.0)) > 1.0)
+                args.acralign_epoch = bool(user_acr and (float(getattr(args, 'tau_curr', 0.0)) >= 0.5))
 
         count_KL = torch.zeros(3).to(args.device)
+
+        if epoch <= args.est_epoch:
+            args.acralign_epoch = False
 
         for batch_idx in range(args.eval_step):
             try:
@@ -539,9 +569,9 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                 unlabeled_iter = iter(unlabeled_trainloader)
                 (inputs_u_w, inputs_u_s, inputs_u_s1), u_real = next(unlabeled_iter)
 
-            u_real = u_real.cuda()
+            u_real = u_real.to(args.device)
             mask_l = (u_real != -2)
-            mask_l = mask_l.cuda()
+            mask_l = mask_l.to(args.device)
 
             data_time.update(time.time() - end)
             batch_size = inputs_x.shape[0]
@@ -566,14 +596,38 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             del logits_b
             Lx_b = F.cross_entropy(logits_x_b + args.adjustment_l2, targets_x, reduction='mean')
 
-            pseudo_label = torch.softmax((logits_u_w.detach() - args.adjustment_l1) / args.T, dim=-1)
-            pseudo_label_h2 = torch.softmax((logits_u_w.detach() - args.adjustment_l12) / args.T, dim=-1)
-            pseudo_label_b = torch.softmax((logits_u_w_b.detach() + args.adjustment_l2) / args.T, dim=-1)
-            pseudo_label_t = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
+            # ---- posteriors (debiased/raw) ----
+            pseudo_label = torch.softmax((logits_u_w.detach() - args.adjustment_l1) / args.T, dim=-1)   # head1 debiased (for head1 PL)
+            pseudo_label_t = torch.softmax(logits_u_w.detach() / args.T, dim=-1)                        # head1 raw (for disagreement)
+            pseudo_label_h2_std = torch.softmax((logits_u_w.detach() - args.adjustment_l12) / args.T, dim=-1)  # head1-alt teacher (for head2)
+            # head2 raw posterior (for disagreement)
+            pseudo_label_b_raw = torch.softmax((logits_u_w_b.detach()) / args.T, dim=-1)
+
+            # head2 posterior on weak unlabeled (for masks / training):
+            # - AF53-mode (tau1=tau12=1): use debiased posterior (+adjustment_l2) -> best consistent
+            # - ACR/CCL-mode (tau1 or tau12 > 1): use raw posterior for better calibration on uniform/reverse
+            acralign = bool(getattr(args, 'acralign_epoch', False))
+            if acralign:
+                pseudo_label_b = pseudo_label_b_raw
+            else:
+                pseudo_label_b = torch.softmax((logits_u_w_b.detach() + args.adjustment_l2) / args.T, dim=-1)
+
+            # ---- disagreement is computed on RAW posteriors to decouple from logit-adjustment ----
+            with torch.no_grad():
+                # js_w = js_divergence(pseudo_label_t, pseudo_label_b_raw) / (math.log(args.num_classes) + 1e-12)
+                js_w = js_divergence(pseudo_label_t, pseudo_label_b_raw) / (math.log(args.num_classes) + 1e-12)
+                js_n = js_w.clamp(0.0, 1.0)
+
+            # ---- JS-weighted soft teacher for head2 (committee fusion) ----
+            # JS small -> trust head1 teacher; JS large -> lean more on head2 posterior.
+            w_mix = js_n.detach()
+            pseudo_label_h2 = (1.0 - w_mix).unsqueeze(1) * pseudo_label_h2_std + w_mix.unsqueeze(1) * pseudo_label_b
+
 
             max_probs, targets_u = torch.max(pseudo_label, dim=-1)
             max_probs_h2, targets_u_h2 = torch.max(pseudo_label_h2, dim=-1)
             max_probs_b, targets_u_b = torch.max(pseudo_label_b, dim=-1)
+            max_probs_b_raw, targets_u_b_raw = torch.max(pseudo_label_b_raw, dim=-1)
             max_probs_t, targets_u_t = torch.max(pseudo_label_t, dim=-1)
 
             # 1) binary masks (bool)
@@ -614,25 +668,30 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                 maskt = max_probs_t.ge(args.threshold)        # head1 (raw) confident
                 maskh2 = max_probs_h2.ge(args.threshold)      # head1-alt teacher confident
 
-            # keep weights in {0,1}: use OR (avoid '+' -> weight 2)
-            mask_sup_h1 = (mask1 | maskt)                 # head1 hard-PL eligibility (keep your original design)
-            mask_sup_h2_ct = maskh2                       # head2 cross-teaching eligibility (teacher == head1-alt)
-            mask_sup_h2_self = mask2                      # head2 self-training eligibility (optional, disabled below)
+            # Supervision weight mode:
+            # - AF53-mode: boolean OR -> weights in {0,1} (best consistent)
+            # - ACR/CCL-mode: addition -> weights in {0,1,2} (better coverage on uniform/reverse)
+            acralign = bool(getattr(args, 'acralign_epoch', False))
+            if acralign:
+                mask_sup_h1 = (mask1.float() + maskt.float())        # head1 hard-PL weight in {0,1,2}
+                mask_sup_h2_ct = (mask2.float() + maskh2.float())    # head2 cross-teaching weight in {0,1,2}
+                mask_sup_h2_self = mask2.float()
+            else:
+                mask_sup_h1 = (mask1 | maskt)                        # head1 hard-PL eligibility
+                mask_sup_h2_ct = maskh2                              # head2 cross-teaching eligibility
+                mask_sup_h2_self = mask2                             # head2 self-training eligibility
 
             # 2) disagreement (normalized JS in [0,1]) and reliability weight
             with torch.no_grad():
-                js_w = js_divergence(pseudo_label, pseudo_label_b) / (math.log(args.num_classes) + 1e-12)
-
-                # DW-SC: treat disagreement as *informative uncertainty*.
-# - We DO NOT downweight hard pseudo-label CE by disagreement (keeps baseline signal).
-# - We DO use disagreement to add a soft-consistency regularizer (defined below).
-                js_n = js_w.clamp(0.0, 1.0)
-                w_dis_eff = torch.ones_like(js_n)
+                # js_w/js_n were computed above on RAW posteriors to decouple disagreement from logit-adjustment.
                 conf_mean = 0.5 * (max_probs.detach() + max_probs_b.detach())
                 w_soft = (js_n * (1.0 - js_n) * conf_mean).clamp(0.0, 1.0)
+                # We keep hard-PL CE weights unchanged by disagreement (baseline behavior).
+                w_dis_eff = torch.ones_like(js_n)
             # ---- disagreement diagnostics (per step, epoch-averaged) ----
             with torch.no_grad():
-                disagree = (targets_u != targets_u_b)
+                # Disagreement on RAW predictions (decoupled from logit-adjustment)
+                disagree = (targets_u_t != targets_u_b_raw)
                 both_conf = (mask1 & mask2)
                 conflict_both = both_conf & disagree
                 conflict_any = disagree & (mask1 | mask2)
@@ -654,7 +713,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                 pred2_s = p2_s.argmax(dim=-1)
                 agree_h1_ws_meter.update((pred1_s == targets_u).float().mean().item())
                 agree_h2_ws_meter.update((pred2_s == targets_u_b).float().mean().item())
-                js_s = (js_divergence(pseudo_label, pseudo_label_b) / (math.log(args.num_classes) + 1e-12)).clamp(0.0, 1.0)
+                js_s = js_n.detach()
                 js_s_meter.update(js_s.mean().item())
 
                 # pseudo-label accuracy on u_real subset (if available)
@@ -679,17 +738,33 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
 
 
 
-            # ---- dynamic tau bookkeeping (restore baseline; DWCT-safe) ----
-            # In baseline, count_KL is accumulated from an EMA estimate of unlabeled label distribution u_py.
-            # Under DWCT, we intentionally estimate u_py ONLY from "safe & agreeing" pseudo-labels
-            # to avoid high-disagreement samples biasing tau.
+            # ---- dynamic tau bookkeeping (AF53 <-> ACR/CCL merge) ----
+            # We update an EMA estimate of unlabeled label distribution u_py, then compute tau via symmetric-KL distances.
+            # Key difference between AF53 and 86e0:
+            #   - AF53 (best consistent): estimate u_py ONLY from safe+agree pseudo-labels (very conservative).
+            #   - 86e0 (best uniform/reverse): estimate u_py from representative head2 confident samples, downweighting high-JS.
+            # We merge them WITHOUT adding new CLI switches:
+            #   - If tau1<=1 and tau12<=1: run AF53 estimation (preserves your best consistent result).
+            #   - Otherwise: run 86e0 estimation (improves uniform/reverse).
             if epoch > args.est_epoch:
                 with torch.no_grad():
                     args.est_step = getattr(args, "est_step", 0) + 1
-                    est_w = (mask_l & mask1 & mask2 & (targets_u == targets_u_b)).float()
+                    acralign = bool(getattr(args, 'acralign_epoch', False))
+
+                    if acralign:
+                        # Representative estimation: head2 confident samples, reliability decreases with disagreement (JS)
+                        est_rel = (1.0 - 0.5 * js_n.detach()).clamp(0.2, 1.0).float()
+                        est_w = mask2.float() * est_rel
+                        est_targets = targets_u_b_raw.long()
+                    else:
+                        # Conservative estimation: only when both heads confident and agree
+                        # Match original AF53 behavior: estimate from u_real-available subset to stabilize tau in consistent
+                        est_w = (mask_l & mask1 & mask2 & (targets_u_t == targets_u_b_raw)).float()
+                        est_targets = targets_u_b_raw.long()
+
                     if est_w.sum() > 0:
-                        now_mask = torch.zeros(args.num_classes, device=args.device)
-                        now_mask.index_add_(0, targets_u_b, est_w)
+                        now_mask = torch.zeros(args.num_classes, device=args.device, dtype=est_w.dtype)
+                        now_mask.index_add_(0, est_targets, est_w.to(now_mask.dtype))
                         if now_mask.sum() > 0:
                             now_mask = now_mask / (now_mask.sum() + 1e-12)
                             args.u_py = args.ema_u * args.u_py + (1 - args.ema_u) * now_mask
@@ -709,9 +784,17 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             # head2 safe self-training gate (only after warmup)
             js_n = js_w.clamp(0.0, 1.0)
             js_self_th = float(getattr(args, 'dwct_js_self_th', 0.20))
-            self_lambda = float(getattr(args, 'dwct_self_lambda', 0.25)) if epoch >= getattr(args, 'est_epoch', 0) else 0.0
-            agree_top1 = (targets_u == targets_u_b)
-            self_mask = (mask2 & mask1 & agree_top1 & (js_n <= js_self_th))
+            acralign = bool(getattr(args, 'acralign_epoch', False))
+
+            # AF53-mode: safe head2 self-training (helps consistent).
+            # ACR/CCL-mode: disable head2 self-confirmation by default (as in ACR/86e0) to improve uniform/reverse stability.
+            if acralign:
+                self_lambda = 0.0
+                self_mask = mask2
+            else:
+                self_lambda = float(getattr(args, 'dwct_self_lambda', 0.25)) if epoch >= getattr(args, 'est_epoch', 0) else 0.0
+                agree_top1 = (targets_u_t == targets_u_b_raw)
+                self_mask = (mask2 & mask1 & agree_top1 & (js_n <= js_self_th))
 
             # weights (per-sample)
             w_h1      = mask_sup_h1.float()      * w_dis_eff
@@ -730,11 +813,18 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             logits_u_s_b_twice = torch.cat([logits_u_s_b, logits_u_s1_b], dim=0)
 
 
-            # FixMatch-style hard CE losses (baseline-style; NOT downweighted by disagreement)
-            Lu = (F.cross_entropy(logits_u_s_twice - args.adjustment_l1, targets_u_twice, reduction='none') * w_h1_twice).mean()
-            Lu_b_ct = (F.cross_entropy(logits_u_s_b_twice + args.adjustment_l2, targets_u_h2_twice, reduction='none') * w_h2_ct_twice).mean()
-            Lu_b_self = (F.cross_entropy(logits_u_s_b_twice + args.adjustment_l2, targets_u_b_twice, reduction='none') * w_h2_self_twice).mean()
-            Lu_b = Lu_b_ct + self_lambda * Lu_b_self
+            # FixMatch-style hard CE losses
+            if acralign:
+                # 86e0-style: raw logits on strong views (robust in uniform/reverse when priors differ)
+                Lu = (F.cross_entropy(logits_u_s_twice, targets_u_twice, reduction='none') * w_h1_twice).mean()
+                Lu_b_ct = (F.cross_entropy(logits_u_s_b_twice, targets_u_h2_twice, reduction='none') * w_h2_ct_twice).mean()
+                Lu_b = Lu_b_ct  # no head2 self-confirmation by default
+            else:
+                # AF53-style: debiased logits on strong views (best consistent in your experiments)
+                Lu = (F.cross_entropy(logits_u_s_twice - args.adjustment_l1, targets_u_twice, reduction='none') * w_h1_twice).mean()
+                Lu_b_ct = (F.cross_entropy(logits_u_s_b_twice + args.adjustment_l2, targets_u_h2_twice, reduction='none') * w_h2_ct_twice).mean()
+                Lu_b_self = (F.cross_entropy(logits_u_s_b_twice + args.adjustment_l2, targets_u_b_twice, reduction='none') * w_h2_self_twice).mean()
+                Lu_b = Lu_b_ct + self_lambda * Lu_b_self
 
             # DW-SC: disagreement-weighted soft consistency (committee posterior) on strong views
             dwsc_lambda = float(getattr(args, 'dwsc_lambda', 0.10))
@@ -753,8 +843,13 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                     q_w = (q_w / (q_w.sum(dim=-1, keepdim=True) + 1e-12)).detach()
                     q_w_twice = torch.cat([q_w, q_w], dim=0)
                     w_soft_twice = torch.cat([w_soft, w_soft], dim=0)
-                logp1_s = F.log_softmax((logits_u_s_twice - args.adjustment_l1) / args.T, dim=-1)
-                logp2_s = F.log_softmax((logits_u_s_b_twice + args.adjustment_l2) / args.T, dim=-1)
+                acralign = bool(getattr(args, 'acralign_epoch', False))
+                if acralign:
+                    logp1_s = F.log_softmax((logits_u_s_twice / args.T), dim=-1)
+                    logp2_s = F.log_softmax((logits_u_s_b_twice / args.T), dim=-1)
+                else:
+                    logp1_s = F.log_softmax((logits_u_s_twice - args.adjustment_l1) / args.T, dim=-1)
+                    logp2_s = F.log_softmax((logits_u_s_b_twice + args.adjustment_l2) / args.T, dim=-1)
                 kl1 = F.kl_div(logp1_s, q_w_twice, reduction='none').sum(dim=-1)
                 kl2 = F.kl_div(logp2_s, q_w_twice, reduction='none').sum(dim=-1)
                 L_soft = ((kl1 + kl2) * 0.5 * w_soft_twice).mean()
@@ -872,6 +967,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                     w = csv.writer(f)
                     w.writerow([
                         epoch,
+                        float(getattr(args, 'tau_curr', 0.0)),
                         mask1_meter.avg, mask2_meter.avg, both_conf_meter.avg, disagree_meter.avg, conflict_both_meter.avg,
                         js_w_meter.avg, js_q50, js_q90, js_q99,
                         js_s_meter.avg, agree_h1_ws_meter.avg, agree_h2_ws_meter.avg,
